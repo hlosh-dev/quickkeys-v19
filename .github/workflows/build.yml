@@ -1,0 +1,990 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Create project files
+        run: |
+          mkdir -p app app/src/main app/src/main/java/com/quickkeys/auto app/src/main/res/values app/src/main/res/xml
+          cat > settings.gradle <<'QK_FILE_END'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "QuickKeysAuto"
+          include ':app'
+          QK_FILE_END
+          cat > build.gradle <<'QK_FILE_END'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          QK_FILE_END
+          cat > gradle.properties <<'QK_FILE_END'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          QK_FILE_END
+          cat > app/build.gradle <<'QK_FILE_END'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.quickkeys.auto'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.quickkeys.auto'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          QK_FILE_END
+          cat > app/src/main/AndroidManifest.xml <<'QK_FILE_END'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="true"
+                  android:label="QuickKeys Auto"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AutoService"
+                      android:exported="true"
+                      android:label="QuickKeys Auto"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+
+              </application>
+          </manifest>
+          QK_FILE_END
+          cat > app/src/main/res/xml/accessibility_config.xml <<'QK_FILE_END'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/service_desc"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100" />
+          QK_FILE_END
+          cat > app/src/main/res/values/strings.xml <<'QK_FILE_END'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="service_desc">QuickKeys Auto: locked chat me messages likhta aur Send dabata hai. Keyboard use nahi karta.</string>
+          </resources>
+          QK_FILE_END
+          cat > app/src/main/java/com/quickkeys/auto/Util.java <<'QK_FILE_END'
+          package com.quickkeys.auto;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Random;
+
+          /** Pure helper logic. No Android calls in here. */
+          final class Util {
+
+              private Util() {
+              }
+
+              /** One message per non-blank line. */
+              static List<String> parseMsgs(String raw) {
+                  List<String> out = new ArrayList<String>();
+                  if (raw == null) return out;
+                  for (String line : raw.split("\\r?\\n")) {
+                      String t = line.trim();
+                      if (!t.isEmpty()) out.add(t);
+                  }
+                  return out;
+              }
+
+              /** Reads "2.5" or "2,5". Falls back to def. Result is kept between min and max. */
+              static double num(String s, double def, double min, double max) {
+                  if (s == null) return def;
+                  try {
+                      double v = Double.parseDouble(s.trim().replace(',', '.'));
+                      if (Double.isNaN(v) || Double.isInfinite(v)) return def;
+                      return Math.max(min, Math.min(max, v));
+                  } catch (NumberFormatException e) {
+                      return def;
+                  }
+              }
+
+              /** True when text / description is the label of a Send button (same words the keyboard app uses). */
+              static boolean isSendLabel(CharSequence cs) {
+                  if (cs == null) return false;
+                  String t = cs.toString().trim().toLowerCase(Locale.ROOT);
+                  return t.equals("send") || t.equals("send message") || t.equals("\u092D\u0947\u091C\u0947\u0902");
+              }
+
+              /** Header texts that keep changing, so they are useless for recognising a chat. */
+              static boolean isVolatile(String s) {
+                  String t = s.toLowerCase(Locale.ROOT);
+                  return t.equals("active now") || t.equals("online") || t.equals("now")
+                          || t.startsWith("active ") || t.startsWith("typing") || t.startsWith("seen")
+                          || t.endsWith(" ago");
+              }
+
+              /** True when the chat that was locked is still the one on screen. */
+              static boolean anchorsMatch(List<String> anchors, List<String> now) {
+                  if (anchors.isEmpty()) return true;
+                  for (String a : anchors) {
+                      if (now.contains(a)) return true;
+                  }
+                  return false;
+              }
+
+              /** Wait before the next message in ms. Never below 0.5 s. */
+              static long delayMs(double gapSec, double jitterSec, Random r) {
+                  double d = gapSec + (jitterSec > 0 ? r.nextDouble() * jitterSec : 0);
+                  return Math.max(500L, (long) (d * 1000));
+              }
+
+              /** Checks that our text really landed in the box. Prefix match, so tiny app-side changes do not block sending. */
+              static boolean typedOk(CharSequence cur, String msg) {
+                  if (cur == null) return false;
+                  String a = cur.toString().trim();
+                  String b = msg.trim();
+                  if (a.isEmpty() || b.isEmpty()) return false;
+                  int n = Math.min(Math.min(a.length(), b.length()), 8);
+                  return a.regionMatches(0, b, 0, n);
+              }
+          }
+          QK_FILE_END
+          cat > app/src/main/java/com/quickkeys/auto/AutoService.java <<'QK_FILE_END'
+          package com.quickkeys.auto;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.accessibilityservice.AccessibilityServiceInfo;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.PixelFormat;
+          import android.graphics.Rect;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.TypedValue;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+          import android.view.accessibility.AccessibilityWindowInfo;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Random;
+
+          /**
+           * Auto sender.
+           * - Never uses the keyboard, so manual typing in any other window stays completely separate.
+           * - LOCK remembers ONE window (app + window id + chat name). Messages go only to that window.
+           * - The window must stay visible on screen (split screen / floating window).
+           */
+          public class AutoService extends AccessibilityService {
+
+              static volatile AutoService inst;
+
+              private static final long MISSING_LIMIT_MS = 60000L;
+              private static final int MAX_FAILS = 4;
+              private static final int MAX_NODES = 1500;
+
+              final Handler h = new Handler(Looper.getMainLooper());
+              private final Random rnd = new Random();
+
+              // lock
+              private String lockedPkg = null;
+              private int lockedWinId = -1;
+              private final List<String> anchors = new ArrayList<String>();
+
+              // run state
+              private boolean running = false;
+              private int runId = 0;
+              private int idx = 0;
+              private int sent = 0;
+              private int total = 0;
+              private int fails = 0;
+              private long missingMs = 0;
+              private int budget = 0;
+
+              // floating panel
+              private WindowManager wm;
+              private View panel;
+              private WindowManager.LayoutParams panelLp;
+              private TextView statusView;
+              private TextView startBtn;
+              String lastStatus = "";
+
+              // ------------------------------------------------------------------ service lifecycle
+
+              @Override
+              protected void onServiceConnected() {
+                  super.onServiceConnected();
+                  inst = this;
+                  try {
+                      AccessibilityServiceInfo info = getServiceInfo();
+                      if (info != null) {
+                          info.flags |= AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
+                          setServiceInfo(info);
+                      }
+                  } catch (Exception ignored) {
+                  }
+                  setStatus("Taiyar. Chat ke andar tap karo, phir LOCK.");
+                  showPanel();
+              }
+
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent event) {
+              }
+
+              @Override
+              public void onInterrupt() {
+              }
+
+              @Override
+              public boolean onUnbind(Intent intent) {
+                  shutdown();
+                  return super.onUnbind(intent);
+              }
+
+              @Override
+              public void onDestroy() {
+                  shutdown();
+                  super.onDestroy();
+              }
+
+              private void shutdown() {
+                  running = false;
+                  runId++;
+                  h.removeCallbacksAndMessages(null);
+                  removePanel();
+                  if (inst == this) inst = null;
+              }
+
+              private SharedPreferences prefs() {
+                  return getSharedPreferences("qk_auto", MODE_PRIVATE);
+              }
+
+              void setStatus(String s) {
+                  lastStatus = s;
+                  if (statusView != null) statusView.setText(s);
+              }
+
+              // ------------------------------------------------------------------ lock / start / stop
+
+              /** Locks the window the user touched last (tap inside the chat first, then press LOCK). */
+              void doLock() {
+                  if (running) {
+                      setStatus("Pehle STOP karo, phir LOCK.");
+                      return;
+                  }
+                  AccessibilityNodeInfo root = getRootInActiveWindow();
+                  if (root == null) {
+                      setStatus("Window nahi mili. Chat ke andar ek baar tap karo, phir LOCK.");
+                      return;
+                  }
+                  String pkg = root.getPackageName() == null ? null : root.getPackageName().toString();
+                  if (pkg == null || pkg.equals(getPackageName()) || pkg.equals("com.android.systemui")) {
+                      AccessibilityNodeInfo alt = topAppRoot();
+                      if (alt != null && alt.getPackageName() != null) {
+                          root = alt;
+                          pkg = alt.getPackageName().toString();
+                      }
+                  }
+                  if (pkg == null || pkg.equals(getPackageName()) || pkg.equals("com.android.systemui")) {
+                      setStatus("Pehle us chat ke andar tap karo (jaha auto chalana hai), phir LOCK.");
+                      return;
+                  }
+                  lockedPkg = pkg;
+                  lockedWinId = -1;
+                  List<AccessibilityWindowInfo> ws = getWindows();
+                  if (ws != null) {
+                      for (AccessibilityWindowInfo w : ws) {
+                          if (w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
+                          if (!(w.isActive() || w.isFocused())) continue;
+                          AccessibilityNodeInfo r = w.getRoot();
+                          if (r != null && same(pkg, r.getPackageName())) {
+                              lockedWinId = w.getId();
+                              break;
+                          }
+                      }
+                  }
+                  anchors.clear();
+                  for (String t : headerTexts(root)) {
+                      if (!Util.isVolatile(t) && anchors.size() < 6) anchors.add(t);
+                  }
+                  String shortPkg = pkg.substring(pkg.lastIndexOf('.') + 1);
+                  if (anchors.isEmpty()) {
+                      setStatus("LOCK: " + shortPkg + " (chat ka naam nahi mila, chat check band)");
+                  } else {
+                      setStatus("LOCK: " + shortPkg + " | " + anchors.get(0));
+                  }
+              }
+
+              /** LOCK fallback: the active (or first) normal app window that is not this app and not system UI. */
+              private AccessibilityNodeInfo topAppRoot() {
+                  List<AccessibilityWindowInfo> ws = getWindows();
+                  if (ws == null) return null;
+                  AccessibilityNodeInfo first = null;
+                  for (AccessibilityWindowInfo w : ws) {
+                      if (w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
+                      AccessibilityNodeInfo r = w.getRoot();
+                      if (r == null || r.getPackageName() == null) continue;
+                      String p = r.getPackageName().toString();
+                      if (p.equals(getPackageName()) || p.equals("com.android.systemui")) continue;
+                      if (w.isActive() || w.isFocused()) return r;
+                      if (first == null) first = r;
+                  }
+                  return first;
+              }
+
+              void startRun() {
+                  if (running) return;
+                  if (lockedPkg == null) {
+                      setStatus("Pehle LOCK karo (chat ke andar tap karke).");
+                      return;
+                  }
+                  if (Util.parseMsgs(prefs().getString("msgs", "")).isEmpty()) {
+                      setStatus("Messages khali hain. App me likh kar SAVE karo.");
+                      return;
+                  }
+                  running = true;
+                  runId++;
+                  idx = 0;
+                  sent = 0;
+                  fails = 0;
+                  missingMs = 0;
+                  updateStartBtn();
+                  setKeepOn(true);
+                  setStatus("Chalu...");
+                  final int id = runId;
+                  h.postDelayed(() -> tick(id), 300);
+              }
+
+              void stopRun(String why) {
+                  running = false;
+                  runId++;
+                  h.removeCallbacksAndMessages(null);
+                  setKeepOn(false);
+                  updateStartBtn();
+                  setStatus(why + " | bheje: " + sent);
+              }
+
+              // ------------------------------------------------------------------ the loop
+
+              private void tick(final int id) {
+                  if (!running || id != runId) return;
+
+                  AccessibilityNodeInfo root = findLockedRoot();
+                  if (root == null) {
+                      waitOrStop(id, "Target window nahi dikh raha. Screen par laao");
+                      return;
+                  }
+                  if (!Util.anchorsMatch(anchors, headerTexts(root))) {
+                      waitOrStop(id, "Chat badal gaya. Wapas wahi chat kholo");
+                      return;
+                  }
+                  missingMs = 0;
+
+                  List<String> msgs = Util.parseMsgs(prefs().getString("msgs", ""));
+                  total = msgs.size();
+                  if (msgs.isEmpty()) {
+                      stopRun("Messages khali");
+                      return;
+                  }
+                  if (idx >= msgs.size()) {
+                      if (prefs().getBoolean("loop", true)) {
+                          idx = 0;
+                      } else {
+                          stopRun("Khatam");
+                          return;
+                      }
+                  }
+                  final String msg = msgs.get(idx);
+
+                  AccessibilityNodeInfo comp = findComposer(root);
+                  if (comp == null) {
+                      failOrRetry(id, "Message box nahi mila");
+                      return;
+                  }
+                  Bundle args = new Bundle();
+                  args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, msg);
+                  if (!comp.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                      failOrRetry(id, "Text set nahi hua");
+                      return;
+                  }
+                  h.postDelayed(() -> afterType(id, msg, 0), 450);
+              }
+
+              private void afterType(final int id, final String msg, final int attempt) {
+                  if (!running || id != runId) return;
+
+                  AccessibilityNodeInfo root = findLockedRoot();
+                  if (root == null) {
+                      waitOrStop(id, "Target window gayab");
+                      return;
+                  }
+                  AccessibilityNodeInfo comp = findComposer(root);
+                  CharSequence cur = comp == null ? null : comp.getText();
+                  if (!Util.typedOk(cur, msg)) {
+                      failOrRetry(id, "Message box me text nahi dikha");
+                      return;
+                  }
+                  AccessibilityNodeInfo send = findSend(root);
+                  if (send == null) {
+                      if (attempt < 6) {
+                          h.postDelayed(() -> afterType(id, msg, attempt + 1), 300);
+                      } else {
+                          failOrRetry(id, "Send button nahi mila");
+                      }
+                      return;
+                  }
+                  AccessibilityNodeInfo target = clickable(send);
+                  if (target == null || !target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                      failOrRetry(id, "Send click nahi hua");
+                      return;
+                  }
+
+                  fails = 0;
+                  sent++;
+                  idx++;
+                  setStatus("Bheja: " + sent + " | agla: " + (idx < total ? idx + 1 : 1) + "/" + total);
+                  double gap = Util.num(prefs().getString("gap", "3"), 3, 0.5, 3600);
+                  double jitter = Util.num(prefs().getString("jitter", "0"), 0, 0, 3600);
+                  h.postDelayed(() -> tick(id), Util.delayMs(gap, jitter, rnd));
+              }
+
+              private void waitOrStop(final int id, String why) {
+                  missingMs += 1000;
+                  if (missingMs >= MISSING_LIMIT_MS) {
+                      stopRun(why + " (60 sec) - auto band");
+                      return;
+                  }
+                  setStatus(why);
+                  h.postDelayed(() -> tick(id), 1000);
+              }
+
+              private void failOrRetry(final int id, String why) {
+                  fails++;
+                  if (fails >= MAX_FAILS) {
+                      stopRun(why + " - auto band");
+                      return;
+                  }
+                  setStatus(why + " (dobara try " + fails + ")");
+                  h.postDelayed(() -> tick(id), 1200);
+              }
+
+              // ------------------------------------------------------------------ finding things on screen
+
+              private static boolean same(String a, CharSequence b) {
+                  return a != null && b != null && a.equals(b.toString());
+              }
+
+              /** Root of the locked window, or null when it is not visible. */
+              private AccessibilityNodeInfo findLockedRoot() {
+                  if (lockedPkg == null) return null;
+                  AccessibilityNodeInfo byPkg = null;
+                  int pkgMatches = 0;
+                  int matchedId = -1;
+                  List<AccessibilityWindowInfo> ws = getWindows();
+                  if (ws != null) {
+                      for (AccessibilityWindowInfo w : ws) {
+                          if (w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
+                          AccessibilityNodeInfo r = w.getRoot();
+                          if (r == null || !same(lockedPkg, r.getPackageName())) continue;
+                          if (w.getId() == lockedWinId) return r;
+                          byPkg = r;
+                          matchedId = w.getId();
+                          pkgMatches++;
+                      }
+                  }
+                  if (pkgMatches == 1) {
+                      lockedWinId = matchedId;
+                      return byPkg;
+                  }
+                  if (pkgMatches == 0 && (ws == null || ws.isEmpty())) {
+                      AccessibilityNodeInfo a = getRootInActiveWindow();
+                      if (a != null && same(lockedPkg, a.getPackageName())) return a;
+                  }
+                  return null;
+              }
+
+              /** Texts in the top part of the window (chat name). Scrolling lists are skipped. */
+              private List<String> headerTexts(AccessibilityNodeInfo root) {
+                  Rect wb = new Rect();
+                  root.getBoundsInScreen(wb);
+                  float d = getResources().getDisplayMetrics().density;
+                  int limitY = wb.top + Math.max((int) (wb.height() * 0.16f), (int) (110 * d));
+                  List<String> out = new ArrayList<String>();
+                  budget = MAX_NODES;
+                  header(root, limitY, out, 0);
+                  return out;
+              }
+
+              private void header(AccessibilityNodeInfo n, int limitY, List<String> out, int depth) {
+                  if (n == null || budget-- <= 0 || depth > 40) return;
+                  if (n.isScrollable()) return;
+                  Rect r = new Rect();
+                  n.getBoundsInScreen(r);
+                  if (r.top >= limitY) return;
+                  CharSequence t = n.getText();
+                  if (t != null && !n.isEditable() && n.isVisibleToUser()) {
+                      String s = t.toString().trim();
+                      if (s.length() >= 2 && s.length() <= 60 && !out.contains(s)) out.add(s);
+                  }
+                  int c = n.getChildCount();
+                  for (int i = 0; i < c; i++) header(n.getChild(i), limitY, out, depth + 1);
+              }
+
+              /** The message box = lowest visible editable field in the window. */
+              private AccessibilityNodeInfo findComposer(AccessibilityNodeInfo root) {
+                  List<AccessibilityNodeInfo> list = new ArrayList<AccessibilityNodeInfo>();
+                  budget = MAX_NODES;
+                  editables(root, list, 0);
+                  AccessibilityNodeInfo best = null;
+                  int bestBottom = Integer.MIN_VALUE;
+                  Rect r = new Rect();
+                  for (AccessibilityNodeInfo n : list) {
+                      n.getBoundsInScreen(r);
+                      if (r.bottom > bestBottom) {
+                          bestBottom = r.bottom;
+                          best = n;
+                      }
+                  }
+                  return best;
+              }
+
+              private void editables(AccessibilityNodeInfo n, List<AccessibilityNodeInfo> out, int depth) {
+                  if (n == null || budget-- <= 0 || depth > 40) return;
+                  if (n.isEditable() && n.isVisibleToUser()) out.add(n);
+                  int c = n.getChildCount();
+                  for (int i = 0; i < c; i++) editables(n.getChild(i), out, depth + 1);
+              }
+
+              /** Send button: same matching as the keyboard app (text or description "send"). Lowest match wins. */
+              private AccessibilityNodeInfo findSend(AccessibilityNodeInfo root) {
+                  String[] terms = {"send", "\u092D\u0947\u091C\u0947\u0902"};
+                  AccessibilityNodeInfo best = null;
+                  int bestBottom = Integer.MIN_VALUE;
+                  Rect r = new Rect();
+                  for (String term : terms) {
+                      List<AccessibilityNodeInfo> found = root.findAccessibilityNodeInfosByText(term);
+                      if (found == null) continue;
+                      for (AccessibilityNodeInfo n : found) {
+                          if (n.isEditable() || !n.isVisibleToUser()) continue;
+                          if (!(Util.isSendLabel(n.getContentDescription()) || Util.isSendLabel(n.getText()))) continue;
+                          if (clickable(n) == null) continue;
+                          n.getBoundsInScreen(r);
+                          if (r.bottom > bestBottom) {
+                              bestBottom = r.bottom;
+                              best = n;
+                          }
+                      }
+                  }
+                  return best;
+              }
+
+              /** The node itself or its nearest clickable parent (up to 4 levels up). */
+              private AccessibilityNodeInfo clickable(AccessibilityNodeInfo n) {
+                  AccessibilityNodeInfo cur = n;
+                  for (int i = 0; i < 5 && cur != null; i++) {
+                      if (cur.isClickable() && cur.isEnabled()) return cur;
+                      cur = cur.getParent();
+                  }
+                  return null;
+              }
+
+              // ------------------------------------------------------------------ floating panel
+
+              void showPanel() {
+                  if (panel != null) return;
+                  try {
+                      wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                      float d = getResources().getDisplayMetrics().density;
+
+                      LinearLayout box = new LinearLayout(this);
+                      box.setOrientation(LinearLayout.VERTICAL);
+                      box.setBackgroundColor(0xE6212121);
+                      int p = (int) (6 * d);
+                      box.setPadding(p, p, p, p);
+
+                      statusView = new TextView(this);
+                      statusView.setTextColor(0xFFFFFFFF);
+                      statusView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+                      statusView.setMaxWidth((int) (230 * d));
+                      statusView.setText(lastStatus.isEmpty() ? "QuickKeys Auto" : lastStatus);
+                      box.addView(statusView);
+
+                      LinearLayout row = new LinearLayout(this);
+                      row.setOrientation(LinearLayout.HORIZONTAL);
+                      TextView lock = mkBtn("LOCK", 0xFF1565C0, d);
+                      startBtn = mkBtn("START", 0xFF2E7D32, d);
+                      TextView close = mkBtn("X", 0xFF616161, d);
+                      row.addView(lock);
+                      row.addView(startBtn);
+                      row.addView(close);
+                      box.addView(row);
+
+                      lock.setOnClickListener(v -> doLock());
+                      startBtn.setOnClickListener(v -> {
+                          if (running) stopRun("Roka");
+                          else startRun();
+                      });
+                      close.setOnClickListener(v -> {
+                          hidePanel();
+                          Toast.makeText(AutoService.this, "Panel chhupa. App me PANEL DIKHAO dabao.", Toast.LENGTH_SHORT).show();
+                      });
+
+                      panelLp = new WindowManager.LayoutParams(
+                              WindowManager.LayoutParams.WRAP_CONTENT,
+                              WindowManager.LayoutParams.WRAP_CONTENT,
+                              WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                              WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                      | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                              PixelFormat.TRANSLUCENT);
+                      panelLp.gravity = Gravity.TOP | Gravity.START;
+                      panelLp.x = (int) (8 * d);
+                      panelLp.y = (int) (120 * d);
+
+                      // drag the panel by touching its background
+                      box.setOnTouchListener(new View.OnTouchListener() {
+                          private int sx;
+                          private int sy;
+                          private float tx;
+                          private float ty;
+
+                          @Override
+                          public boolean onTouch(View v, MotionEvent e) {
+                              switch (e.getActionMasked()) {
+                                  case MotionEvent.ACTION_DOWN:
+                                      sx = panelLp.x;
+                                      sy = panelLp.y;
+                                      tx = e.getRawX();
+                                      ty = e.getRawY();
+                                      return true;
+                                  case MotionEvent.ACTION_MOVE:
+                                      panelLp.x = sx + (int) (e.getRawX() - tx);
+                                      panelLp.y = sy + (int) (e.getRawY() - ty);
+                                      try {
+                                          wm.updateViewLayout(panel, panelLp);
+                                      } catch (Exception ignored) {
+                                      }
+                                      return true;
+                                  default:
+                                      return true;
+                              }
+                          }
+                      });
+
+                      panel = box;
+                      wm.addView(panel, panelLp);
+                      updateStartBtn();
+                  } catch (Exception e) {
+                      panel = null;
+                  }
+              }
+
+              void hidePanel() {
+                  if (running) stopRun("Panel band");
+                  removePanel();
+              }
+
+              private void removePanel() {
+                  if (panel != null && wm != null) {
+                      try {
+                          wm.removeView(panel);
+                      } catch (Exception ignored) {
+                      }
+                  }
+                  panel = null;
+                  statusView = null;
+                  startBtn = null;
+              }
+
+              private TextView mkBtn(String label, int color, float d) {
+                  TextView b = new TextView(this);
+                  b.setText(label);
+                  b.setTextColor(0xFFFFFFFF);
+                  b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+                  b.setGravity(Gravity.CENTER);
+                  b.setBackgroundColor(color);
+                  b.setPadding((int) (12 * d), (int) (8 * d), (int) (12 * d), (int) (8 * d));
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                  lp.setMargins((int) (2 * d), (int) (4 * d), (int) (2 * d), 0);
+                  b.setLayoutParams(lp);
+                  return b;
+              }
+
+              private void updateStartBtn() {
+                  if (startBtn == null) return;
+                  startBtn.setText(running ? "STOP" : "START");
+                  startBtn.setBackgroundColor(running ? 0xFFC62828 : 0xFF2E7D32);
+              }
+
+              /** Keeps the screen awake while auto is running (the locked window must stay visible). */
+              private void setKeepOn(boolean on) {
+                  if (panel == null || wm == null || panelLp == null) return;
+                  if (on) panelLp.flags |= WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON;
+                  else panelLp.flags &= ~WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON;
+                  try {
+                      wm.updateViewLayout(panel, panelLp);
+                  } catch (Exception ignored) {
+                  }
+              }
+          }
+          QK_FILE_END
+          cat > app/src/main/java/com/quickkeys/auto/MainActivity.java <<'QK_FILE_END'
+          package com.quickkeys.auto;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.text.InputType;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.CheckBox;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          /** Settings screen. The real work happens in AutoService (floating panel). */
+          public class MainActivity extends Activity {
+
+              private static final String HELP =
+                      "KAISE CHALAYEIN\n\n"
+                              + "1. ACCESSIBILITY SETTINGS dabao, list me QuickKeys Auto kholo aur ON karo. "
+                              + "Agar ON nahi ho raha: APP INFO dabao, upar-right teen dot (menu) me "
+                              + "Allow restricted settings dabao, phir wapas aake ON karo.\n\n"
+                              + "2. Upar messages likho (har line = 1 message) aur SAVE dabao.\n\n"
+                              + "3. Jis app me auto bhejna hai (jaise Instagram) wo chat kholo. "
+                              + "Ye window screen par dikhti rehni chahiye, isliye split-screen ya floating window me kholo. "
+                              + "Doosri window me wo app rakho jisme tum khud manual likhoge.\n\n"
+                              + "4. Auto wali chat ke andar ek baar tap karo, phir floating panel me LOCK dabao.\n\n"
+                              + "5. START dabao. Messages usi locked chat me ek ke baad ek jayenge. STOP dabane par ruk jayega.\n\n"
+                              + "6. Doosri window me apni keyboard se manual likho. Auto keyboard use nahi karta, "
+                              + "isliye dono bilkul alag rehte hain.\n\n"
+                              + "Dhyan: chat badal gayi ya window screen se hat gayi to auto ruk kar wait karta hai "
+                              + "aur 60 second baad band ho jata hai. App ko recents se swipe mat karo, bas minimize karo.";
+
+              private SharedPreferences sp;
+              private EditText msgBox;
+              private EditText gapBox;
+              private EditText jitterBox;
+              private CheckBox loopBox;
+              private TextView statusView;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  sp = getSharedPreferences("qk_auto", MODE_PRIVATE);
+                  float d = getResources().getDisplayMetrics().density;
+                  int pad = (int) (16 * d);
+
+                  ScrollView scroll = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(pad, pad, pad, pad);
+                  scroll.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("QuickKeys Auto");
+                  title.setTextSize(24);
+                  root.addView(title);
+
+                  statusView = new TextView(this);
+                  statusView.setTextSize(15);
+                  statusView.setPadding(0, (int) (8 * d), 0, (int) (8 * d));
+                  root.addView(statusView);
+
+                  root.addView(btn("ACCESSIBILITY SETTINGS", v ->
+                          startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))));
+
+                  root.addView(btn("APP INFO (restricted settings ke liye)", v -> {
+                      Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                      i.setData(Uri.parse("package:" + getPackageName()));
+                      startActivity(i);
+                  }));
+
+                  root.addView(label("Messages (har line = 1 message)", d));
+                  msgBox = new EditText(this);
+                  msgBox.setHint("Ek line = ek message");
+                  msgBox.setMinLines(6);
+                  msgBox.setGravity(Gravity.TOP | Gravity.START);
+                  msgBox.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+                  msgBox.setText(sp.getString("msgs", ""));
+                  root.addView(msgBox);
+
+                  root.addView(label("Gap (seconds) - ek message se doosre tak", d));
+                  gapBox = new EditText(this);
+                  gapBox.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+                  gapBox.setText(sp.getString("gap", "3"));
+                  root.addView(gapBox);
+
+                  root.addView(label("Random extra wait (seconds, 0 = band)", d));
+                  jitterBox = new EditText(this);
+                  jitterBox.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+                  jitterBox.setText(sp.getString("jitter", "0"));
+                  root.addView(jitterBox);
+
+                  loopBox = new CheckBox(this);
+                  loopBox.setText("Loop: list khatam hone par phir se shuru");
+                  loopBox.setChecked(sp.getBoolean("loop", true));
+                  root.addView(loopBox);
+
+                  root.addView(btn("SAVE", v -> {
+                      save();
+                      Toast.makeText(this, "Save ho gaya", Toast.LENGTH_SHORT).show();
+                  }));
+
+                  root.addView(btn("PANEL DIKHAO", v -> {
+                      AutoService s = AutoService.inst;
+                      if (s == null) {
+                          Toast.makeText(this, "Pehle Accessibility ON karo", Toast.LENGTH_SHORT).show();
+                          return;
+                      }
+                      s.showPanel();
+                      Toast.makeText(this, "Panel screen par aa gaya", Toast.LENGTH_SHORT).show();
+                  }));
+
+                  root.addView(label(HELP, d));
+
+                  setContentView(scroll);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  refresh();
+              }
+
+              @Override
+              protected void onPause() {
+                  save();
+                  super.onPause();
+              }
+
+              private void save() {
+                  sp.edit()
+                          .putString("msgs", msgBox.getText().toString())
+                          .putString("gap", gapBox.getText().toString().trim())
+                          .putString("jitter", jitterBox.getText().toString().trim())
+                          .putBoolean("loop", loopBox.isChecked())
+                          .apply();
+              }
+
+              private void refresh() {
+                  AutoService s = AutoService.inst;
+                  String t = s == null ? "Accessibility: OFF" : "Accessibility: ON";
+                  if (s != null && s.lastStatus != null && !s.lastStatus.isEmpty()) {
+                      t += "\n" + s.lastStatus;
+                  }
+                  statusView.setText(t);
+              }
+
+              private Button btn(String text, View.OnClickListener l) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setOnClickListener(l);
+                  return b;
+              }
+
+              private TextView label(String text, float d) {
+                  TextView t = new TextView(this);
+                  t.setText(text);
+                  t.setTextSize(14);
+                  t.setPadding(0, (int) (12 * d), 0, (int) (4 * d));
+                  return t;
+              }
+          }
+          QK_FILE_END
+
+      - name: Android SDK platform 34
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk QuickKeysAuto.apk
+
+      - name: Keep APK as download (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickKeysAuto
+          path: QuickKeysAuto.apk
+          if-no-files-found: error
+
+      - name: Publish APK in Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" QuickKeysAuto.apk --title "QuickKeys Auto build ${{ github.run_number }}" --notes "Debug APK. Download QuickKeysAuto.apk, install it, then turn ON Accessibility."
